@@ -8,8 +8,9 @@ Workflow:
 1. Gorgias webhook → New/updated ticket
 2. Extract customer identifier (email, Shopify ID, etc.)
 3. Query analytics API for customer insights
-4. Generate personalized draft reply using Claude Haiku
-5. Post draft reply back to Gorgias ticket
+4. Fetch order fulfillment data (multi-warehouse tracking)
+5. Generate personalized draft reply using Claude Haiku
+6. Post draft reply back to Gorgias ticket
 """
 import logging
 import os
@@ -19,6 +20,14 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 import httpx
 import anthropic
+
+# NEW: Import fulfillment enrichment modules
+from integrations.ticket_fulfillment_enricher import (
+    enrich_ticket_with_fulfillments,
+    extract_order_number_from_ticket,
+    format_fulfillment_summary_for_ai,
+    format_fulfillment_for_internal_note
+)
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +227,48 @@ class GorgiasAIAssistant:
             # Merge: Shopify data (PRIMARY) + behavioral data (SUPPLEMENTAL)
             analytics = self._merge_analytics(shopify_metrics, behavioral_analytics, customer_data)
             logger.info(f"Analytics ready: Shopify LTV=${shopify_metrics.get('lifetime_value', 0)}, Orders={shopify_metrics.get('total_orders', 0)}, LCC={analytics.get('is_lcc_member')}")
+
+            # NEW: Enrich with fulfillment data (multi-warehouse tracking)
+            try:
+                logger.info(f"Checking for order fulfillment data...")
+                order_number = extract_order_number_from_ticket(normalized_webhook_data)
+
+                if order_number:
+                    logger.info(f"Order number found: #{order_number}, fetching fulfillment data...")
+                    fulfillment_data = await enrich_ticket_with_fulfillments(
+                        ticket_data=normalized_webhook_data,
+                        order_number=order_number
+                    )
+
+                    if fulfillment_data and fulfillment_data.get("fulfillments"):
+                        analytics["fulfillment"] = fulfillment_data
+                        logger.info(
+                            f"✅ Fulfillment data enriched: {fulfillment_data.get('fulfillment_count')} shipment(s), "
+                            f"Split: {fulfillment_data.get('has_split_shipment')}, "
+                            f"Warehouses: {fulfillment_data.get('warehouse_count')}"
+                        )
+
+                        # Post internal note if this is a split shipment
+                        if fulfillment_data.get("has_split_shipment"):
+                            try:
+                                internal_note = format_fulfillment_for_internal_note(fulfillment_data)
+                                await self._post_internal_note(
+                                    ticket_id=ticket_id,
+                                    note_content=internal_note,
+                                    note_type="split_shipment_info"
+                                )
+                                logger.info(f"✅ Posted split shipment internal note to ticket #{ticket_id}")
+                            except Exception as note_err:
+                                logger.warning(f"Failed to post fulfillment note: {note_err}")
+                    else:
+                        logger.info(f"No fulfillment data available for order #{order_number}")
+                else:
+                    logger.info(f"No order number found in ticket - skipping fulfillment enrichment")
+
+            except Exception as fulfillment_err:
+                # Don't fail the entire webhook processing if fulfillment fetch fails
+                logger.warning(f"Failed to enrich fulfillment data: {fulfillment_err}", exc_info=True)
+                analytics["fulfillment"] = None
 
             # NEW: Detect urgency keywords in customer message
             urgency_data = self._detect_urgency_keywords(customer_message)
@@ -924,13 +975,14 @@ class GorgiasAIAssistant:
             priority_data=priority_data
         )
 
-        # Build prompt for Claude
+        # Build prompt for Claude (now includes fulfillment data)
         prompt = self._build_response_prompt(
             customer_message=customer_message,
             customer_name=customer_data.get("name", "there"),
             analytics_summary=analytics_summary,
             ticket_context=ticket_context,
-            ticket_source=ticket_source
+            ticket_source=ticket_source,
+            analytics=analytics  # Pass full analytics including fulfillment
         )
 
         try:
@@ -1054,6 +1106,35 @@ class GorgiasAIAssistant:
         if archetype_insight:
             summary_lines.append(f"🎯 Pattern: {archetype_insight}")
 
+        # NEW: Add fulfillment information if available
+        fulfillment = analytics.get("fulfillment")
+        if fulfillment and fulfillment.get("fulfillments"):
+            summary_lines.append("")  # Blank line
+            summary_lines.append("📦 ORDER FULFILLMENT STATUS")
+            summary_lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+            order_name = fulfillment.get("order_name", "Order")
+            fulfillment_status = fulfillment.get("fulfillment_status", "UNKNOWN")
+            summary_lines.append(f"Order: {order_name} - Status: {fulfillment_status}")
+
+            if fulfillment.get("has_split_shipment"):
+                fulfillment_count = fulfillment.get("fulfillment_count", 0)
+                warehouse_count = fulfillment.get("warehouse_count", 0)
+                summary_lines.append(f"⚠️  SPLIT SHIPMENT: {fulfillment_count} packages from {warehouse_count} warehouse(s)")
+
+            # Show brief fulfillment summary
+            for i, f in enumerate(fulfillment.get("fulfillments", [])[:2], 1):  # Show first 2
+                warehouse_name = f.get("warehouse", {}).get("name", "Unknown")
+                tracking = f.get("tracking", {})
+                carrier = tracking.get("carrier", "Unknown")
+                tracking_num = tracking.get("number", "N/A")
+                item_count = f.get("item_count", 0)
+
+                summary_lines.append(f"  Shipment {i}: {carrier} {tracking_num[:12]}... from {warehouse_name} ({item_count} items)")
+
+            if fulfillment.get("unfulfilled_items_count", 0) > 0:
+                summary_lines.append(f"  ⏳ {fulfillment['unfulfilled_items_count']} items not yet shipped")
+
         # Add retention recommendation
         recommendation = self._get_retention_recommendation(ltv, churn_risk, ltv_category, churn_category)
         if recommendation:
@@ -1157,12 +1238,28 @@ class GorgiasAIAssistant:
         customer_name: str,
         analytics_summary: str,
         ticket_context: Dict[str, Any],
-        ticket_source: str = "unknown"
+        ticket_source: str = "unknown",
+        analytics: Optional[Dict[str, Any]] = None
     ) -> str:
         """Build prompt for Claude to generate response."""
 
         # Detect ticket category
         category = self._detect_ticket_category(customer_message)
+
+        # NEW: Extract fulfillment data if available
+        fulfillment_context = ""
+        if analytics and analytics.get("fulfillment"):
+            fulfillment_data = analytics["fulfillment"]
+            if fulfillment_data.get("fulfillments"):
+                # Format fulfillment data for AI context
+                fulfillment_summary = format_fulfillment_summary_for_ai(fulfillment_data)
+                fulfillment_context = f"\n\nORDER FULFILLMENT INFORMATION (Use this to answer shipping/tracking questions):\n{fulfillment_summary}\n"
+
+                # Add special instructions if split shipment
+                if fulfillment_data.get("has_split_shipment"):
+                    fulfillment_context += "\n⚠️  IMPORTANT: This order has SPLIT SHIPMENTS from multiple warehouses.\n"
+                    fulfillment_context += "If customer asks about a 'missing' item, CHECK which shipment it's in before assuming it's missing!\n"
+                    fulfillment_context += "Explain that items are arriving in separate packages for faster delivery.\n"
 
         # Source-specific instructions
         source_instructions = {
@@ -1192,7 +1289,7 @@ This draft will be reviewed by a CS agent who will make the final decision on di
 
 CUSTOMER ANALYTICS (Use for context, DO NOT share specifics):
 {analytics_summary}
-
+{fulfillment_context}
 CUSTOMER'S MESSAGE:
 {customer_message}
 
@@ -1639,6 +1736,57 @@ Customer Success Team"""
 
         except Exception as e:
             logger.error(f"Error posting draft reply: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    async def _post_internal_note(
+        self,
+        ticket_id: str,
+        note_content: str,
+        note_type: str = "info"
+    ) -> Dict[str, Any]:
+        """
+        Post an internal note to Gorgias ticket (for fulfillment info, etc.).
+
+        Args:
+            ticket_id: Gorgias ticket ID
+            note_content: Note content (supports Markdown)
+            note_type: Type of note (e.g., "split_shipment_info", "fulfillment", "info")
+
+        Returns:
+            API response
+        """
+        try:
+            # Prefix note with type indicator
+            prefixed_content = f"[{note_type.upper()}]\n{note_content}"
+
+            message_payload = {
+                "channel": "internal-note",
+                "sender": {"id": None},
+                "body_text": prefixed_content,
+                "via": "api"
+            }
+
+            response = await self.http_client.post(
+                f"{self.gorgias_base_url}/tickets/{ticket_id}/messages",
+                json=message_payload,
+                auth=self.gorgias_auth
+            )
+            response.raise_for_status()
+
+            result = response.json()
+            logger.info(f"Posted internal note ({note_type}) to ticket #{ticket_id}")
+
+            return {
+                "success": True,
+                "message_id": result.get("id"),
+                "note_type": note_type
+            }
+
+        except Exception as e:
+            logger.error(f"Error posting internal note: {e}")
             return {
                 "success": False,
                 "error": str(e)
