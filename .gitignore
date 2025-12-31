@@ -58,3 +58,4 @@ Thumbs.db
 !.gitkeep
 !.env.example
 backend/api/auth.py
+packages/
