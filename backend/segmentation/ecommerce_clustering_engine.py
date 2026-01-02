@@ -190,6 +190,22 @@ class EcommerceClusteringEngine:
         if self.use_fuzzy_cmeans:
             logger.info(f"✅ Fuzzy C-Means ENABLED (m={self.fuzzy_m})")
 
+        # Hierarchical clustering (for recursive segment subdivision)
+        self.enable_hierarchical = os.getenv("ENABLE_HIERARCHICAL_CLUSTERING", "false").lower() == "true"
+        self.hierarchical_engine = None
+
+        if self.enable_hierarchical:
+            from backend.segmentation.hierarchical_clustering import HierarchicalClusteringEngine
+            self.hierarchical_engine = HierarchicalClusteringEngine(
+                max_intra_variance=2.0,
+                max_diameter_percentile=95.0,
+                max_segment_pct=60.0,
+                min_segment_size_for_split=100,
+                max_depth=3,
+                min_subsegment_size=30
+            )
+            logger.info("✅ Hierarchical Subdivision ENABLED")
+
         # Feature extractor will be imported separately
         self.feature_extractor = None
 
@@ -784,6 +800,108 @@ class EcommerceClusteringEngine:
             )
 
             segments.append(segment)
+
+        # Hierarchical subdivision: Refine overly-broad segments
+        if self.enable_hierarchical and self.hierarchical_engine:
+            logger.info(f"{axis_name}: Analyzing segments for hierarchical subdivision")
+
+            refined_segments = []
+            for cluster_id, segment in enumerate(segments):
+                # Analyze if this segment needs subdivision
+                segment_mask = labels == cluster_id
+
+                # Calculate cluster center in original space for AI naming
+                if scaler_params['type'] == 'robust':
+                    center = np.array(scaler_params['center'])
+                    scale = np.array(scaler_params['scale'])
+                    cluster_center_original = (segment.cluster_center * scale) + center
+                else:
+                    mean = np.array(scaler_params['mean'])
+                    scale = np.array(scaler_params['scale'])
+                    cluster_center_original = (segment.cluster_center * scale) + mean
+
+                diversity = self.hierarchical_engine.analyze_segment_diversity(
+                    X_scaled,
+                    segment_mask,
+                    segment.cluster_center,
+                    feature_names,
+                    len(customer_ids)
+                )
+
+                if diversity.needs_subdivision:
+                    logger.info(
+                        f"{axis_name}/{segment.segment_name}: Subdividing - {diversity.subdivision_reason}"
+                    )
+
+                    # Create clustering function for recursive subdivision
+                    def cluster_func(X_subset):
+                        k_sub = min(3, max(2, len(X_subset) // 50))  # 2-3 sub-clusters
+                        kmeans_sub = KMeans(n_clusters=k_sub, random_state=42, n_init=10)
+                        return kmeans_sub.fit_predict(X_subset)
+
+                    # Recursively subdivide this segment
+                    sub_hierarchy = self.hierarchical_engine.recursive_cluster_segment(
+                        X_scaled,
+                        segment_mask,
+                        segment.cluster_center,
+                        feature_names,
+                        len(customer_ids),
+                        cluster_func,
+                        current_depth=0,
+                        parent_id=segment.segment_name
+                    )
+
+                    # Flatten hierarchy and create DiscoveredSegment objects for sub-segments
+                    flattened = self.hierarchical_engine.flatten_hierarchy(sub_hierarchy)
+
+                    for sub_seg in flattened:
+                        # Calculate center from diversity metrics
+                        # Note: hierarchical engine doesn't return center directly,
+                        # we use the segment_id as the hierarchical name
+                        sub_seg_id = sub_seg['segment_id']
+
+                        # For now, use segment_id as part of name (will be refined by AI naming)
+                        # Extract the deepest level of hierarchy for readable names
+                        sub_seg_suffix = sub_seg_id.split('.')[-1] if '.' in sub_seg_id else sub_seg_id
+
+                        # Generate AI name for sub-segment
+                        # Use original segment center scaled for this sub-segment
+                        # (approximation - hierarchical engine would need to export centers)
+                        sub_name, sub_interpretation = await self._name_segment_with_ai(
+                            axis_name,
+                            cluster_center_original,  # Use parent center as approximation
+                            feature_names,
+                            X
+                        )
+
+                        # Make sub-segment name unique by appending hierarchy suffix
+                        sub_name_unique = f"{sub_name}_{sub_seg_suffix}"
+
+                        refined_segment = DiscoveredSegment(
+                            segment_id=f"{store_id}_{axis_name}_{sub_name_unique}",
+                            axis_name=axis_name,
+                            segment_name=sub_name_unique,
+                            cluster_center=segment.cluster_center,  # Use parent center scaled
+                            feature_names=feature_names,
+                            scaler_params=scaler_params,
+                            population_percentage=sub_seg['customer_count'] / len(customer_ids),
+                            customer_count=sub_seg['customer_count'],
+                            interpretation=f"{sub_interpretation} (hierarchical: {sub_seg_id})",
+                            fuzzy_membership_matrix=None,
+                            customer_fuzzy_scores=None
+                        )
+
+                        refined_segments.append(refined_segment)
+
+                    logger.info(
+                        f"{axis_name}/{segment.segment_name}: Split into {len(flattened)} sub-segments"
+                    )
+                else:
+                    # Keep original segment if no subdivision needed
+                    refined_segments.append(segment)
+
+            segments = refined_segments
+            logger.info(f"{axis_name}: After hierarchical subdivision: {len(segments)} segments")
 
         return segments
 
