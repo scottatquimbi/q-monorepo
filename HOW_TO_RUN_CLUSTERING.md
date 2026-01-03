@@ -2,13 +2,20 @@
 
 This guide shows how to rerun the behavioral segmentation clustering on customer data.
 
+**Related Documentation**:
+- [L1/L2/L3 Archetype Methodology](L1_L2_L3_ARCHETYPE_METHODOLOGY.md) - **NEW**: Three-tier behavioral fingerprinting system
+- [Hierarchical Clustering Integration](HIERARCHICAL_CLUSTERING_INTEGRATION.md) - Automatic subdivision of broad segments
+- [AI Personalization Comparison](AI_PERSONALIZATION_COMPARISON_9_VS_13_AXES.md) - Impact on AI/ML personalization
+
 ## Overview
 
 The clustering system has **3 tiers**:
 
-1. **Tier 1**: K-means clustering per axis → 40-60 segments across 13-14 axes
-2. **Tier 2**: Archetype combinations → 100-200 unique behavioral archetypes
-3. **Tier 3**: Individual fuzzy membership vectors → Every customer gets fuzzy scores (0-1) for ALL segments
+1. **Tier 1 (L1 - Dominant)**: Dominant segment per axis → Simple, interpretable profiles
+2. **Tier 2 (L2 - Significant)**: Fuzzy memberships ≥10% → Hybrid personas for AI personalization
+3. **Tier 3 (L3 - Complete)**: Full fuzzy thumbprint → Complete behavioral DNA for research
+
+**Note**: The new L1/L2/L3 system (documented in [L1_L2_L3_ARCHETYPE_METHODOLOGY.md](L1_L2_L3_ARCHETYPE_METHODOLOGY.md)) replaces the previous archetype system and provides balanced, statistically-valid segments at all levels.
 
 ---
 

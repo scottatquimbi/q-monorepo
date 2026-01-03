@@ -4,6 +4,11 @@
 
 Successfully integrated hierarchical clustering into the main `EcommerceClusteringEngine` to enable automatic subdivision of overly-broad segments. This addresses the critical issue identified in the clustering analysis where 67.5% of customers were grouped into a single "regular buyers" segment.
 
+**Related Documentation**:
+- [L1/L2/L3 Archetype Methodology](L1_L2_L3_ARCHETYPE_METHODOLOGY.md) - Three-tier behavioral fingerprinting system
+- [AI Personalization Comparison](AI_PERSONALIZATION_COMPARISON_9_VS_13_AXES.md) - Impact on AI/ML personalization
+- [Archetype Distribution Comparison](ARCHETYPE_DISTRIBUTION_COMPARISON.md) - Current vs new system analysis
+
 ## Changes Made
 
 ### 1. Engine Initialization (`ecommerce_clustering_engine.py:193-207`)

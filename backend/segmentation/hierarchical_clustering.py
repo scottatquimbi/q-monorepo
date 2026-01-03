@@ -260,6 +260,7 @@ class HierarchicalClusteringEngine:
                 'depth': current_depth,
                 'customer_count': diversity.customer_count,
                 'diversity': diversity,
+                'cluster_center': cluster_center,  # CRITICAL: Export actual center
                 'is_leaf': True,
                 'subsegments': None
             }]
@@ -310,6 +311,7 @@ class HierarchicalClusteringEngine:
                 'depth': current_depth,
                 'customer_count': diversity.customer_count,
                 'diversity': diversity,
+                'cluster_center': cluster_center,  # Export center for non-leaf too
                 'is_leaf': False,
                 'subsegments': subsegments
             }]
@@ -322,6 +324,7 @@ class HierarchicalClusteringEngine:
                 'depth': current_depth,
                 'customer_count': diversity.customer_count,
                 'diversity': diversity,
+                'cluster_center': cluster_center,  # Export center for error case
                 'is_leaf': True,
                 'subsegments': None,
                 'subdivision_error': str(e)

@@ -854,17 +854,44 @@ class EcommerceClusteringEngine:
                     # Flatten hierarchy and create DiscoveredSegment objects for sub-segments
                     flattened = self.hierarchical_engine.flatten_hierarchy(sub_hierarchy)
 
+                    # Track segment index for unique naming
+                    segment_index = len(refined_segments)
+
                     for sub_seg in flattened:
                         # Calculate center from diversity metrics
                         # Note: hierarchical engine doesn't return center directly,
                         # we use the segment_id as the hierarchical name
                         sub_seg_id = sub_seg['segment_id']
 
-                        # For now, use segment_id as part of name (will be refined by AI naming)
-                        # Extract the deepest level of hierarchy for readable names
-                        sub_seg_suffix = sub_seg_id.split('.')[-1] if '.' in sub_seg_id else sub_seg_id
+                        # ROBUST FIX: Use coordinate-based naming
+                        # Format: {axis_name}_{semantic_name}_{hierarchical_coordinates}
+                        #
+                        # Example: "purchase_frequency_medium_buyers_h0d1s2"
+                        #   - axis_name: purchase_frequency
+                        #   - semantic_name: medium_buyers (from AI/fallback)
+                        #   - coordinates: h0d1s2 (hierarchical path 0.1.2 with prefixes)
+                        #
+                        # This format ensures:
+                        # 1. Globally unique names (coordinates are unique within axis)
+                        # 2. Human-readable semantic meaning
+                        # 3. Traceable to hierarchical structure
+                        # 4. No conflicts with underscores in parent names
 
-                        # Generate AI name for sub-segment
+                        # Extract hierarchical path and convert to coordinates
+                        # "medium_purchase_frequency.0.1.2" -> "0.1.2"
+                        if '.' in sub_seg_id:
+                            path_parts = sub_seg_id.split('.')
+                            # First part is parent name, rest are coordinates
+                            coordinates = path_parts[1:]  # ['0', '1', '2']
+                            # Create coordinate string: h0d1s2 (h=first level, d=depth, s=sub)
+                            coord_prefixes = ['h', 'd', 's', 't']  # Support up to 4 levels
+                            coord_str = ''.join(f"{coord_prefixes[i]}{coord}"
+                                               for i, coord in enumerate(coordinates[:len(coord_prefixes)]))
+                        else:
+                            # Non-hierarchical segment, use simple index
+                            coord_str = 'root'
+
+                        # Generate AI name for sub-segment (for semantic meaning)
                         # Use original segment center scaled for this sub-segment
                         # (approximation - hierarchical engine would need to export centers)
                         sub_name, sub_interpretation = await self._name_segment_with_ai(
@@ -874,14 +901,34 @@ class EcommerceClusteringEngine:
                             X
                         )
 
-                        # Make sub-segment name unique by appending hierarchy suffix
-                        sub_name_unique = f"{sub_name}_{sub_seg_suffix}"
+                        # Construct final unique name: axis_semantic_coordinates_index
+                        # Format: {axis}_{semantic}_{coords}_{idx}
+                        # Example: "purchase_frequency_medium_buyers_h0d1s2_seg003"
+                        semantic_part = sub_name.replace(f"{axis_name}_", "") if sub_name.startswith(f"{axis_name}_") else sub_name
+                        sub_name_unique = f"{axis_name}_{semantic_part}_{coord_str}_seg{segment_index:03d}"
+                        segment_index += 1  # Increment for next segment
+
+                        # CRITICAL FIX: Use actual cluster center from hierarchical segment
+                        # Previous code used parent center for all children, causing uniform fuzzy scores
+                        subseg_center_raw = sub_seg.get('cluster_center')
+                        if subseg_center_raw is None:
+                            logger.warning(f"No cluster_center found for {sub_seg_id}, using parent center")
+                            subseg_center_scaled = segment.cluster_center
+                        else:
+                            # Scale the center using the same scaler that was used for population
+                            # Determine scaler type from scaler_params
+                            if 'center' in scaler_params:
+                                # RobustScaler
+                                subseg_center_scaled = (subseg_center_raw - center) / scale
+                            else:
+                                # StandardScaler
+                                subseg_center_scaled = (subseg_center_raw - mean) / scale
 
                         refined_segment = DiscoveredSegment(
                             segment_id=f"{store_id}_{axis_name}_{sub_name_unique}",
                             axis_name=axis_name,
                             segment_name=sub_name_unique,
-                            cluster_center=segment.cluster_center,  # Use parent center scaled
+                            cluster_center=subseg_center_scaled,  # Use ACTUAL segment center (scaled)
                             feature_names=feature_names,
                             scaler_params=scaler_params,
                             population_percentage=sub_seg['customer_count'] / len(customer_ids),
